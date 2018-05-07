@@ -19,7 +19,7 @@
          <br><br>
          <ul id ="ul" class = "ul">
            {{#each patients}}
-             <li style= "padding: 10px">
+             <li class="listButtons">
                <a href= '/clinician/patientexercises/{{this.patientId}}' style="color: #525B74;" title='{{this.name}}'>{{this.patientId}}</a>
             </li>
           {{/each}}

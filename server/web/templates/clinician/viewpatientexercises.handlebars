@@ -23,10 +23,8 @@
          <br><br>    
          <ul>
            {{#each exercises}}
-             <li>
-               <div class="listButtons">
-                 <a href= '/userexercise/session/start/{{this._id}}/{{patientId}}'>{{formatName this.exerciseName}}</a>
-               </div> 
+             <li class="listButtons">
+               <a href= '/userexercise/session/start/{{this._id}}/{{patientId}}'>{{formatName this.exerciseName}}</a>
              </li>
           {{/each}}
         </ul>
