@@ -4,6 +4,7 @@ var Kinect2 = require('kinect2'),
 	server = require('http').createServer(app),
 	io = require('socket.io').listen(server);
 	XLSX = require('xlsx');
+	numeric = require('numeric');
 const fs = require('fs');
 
 var kinect = new Kinect2();
@@ -13,7 +14,7 @@ if(kinect.open()) {
 	server.listen(8000);
 	console.log('Server listening on port 8000');
 	console.log('Point your browser to http://localhost:8000');
-	app.use(express.static('public'))
+	app.use(express.static('public'));
 
 	// Initiation
 
@@ -23,7 +24,15 @@ if(kinect.open()) {
 
 	// Data Storage, global variables in server
 	var	bufferTrial= [], // trial is a number of activities, including ground truth (gt) and exercises
-			bufferBodyFrames =[], gtArray = [], exArray = [];
+      bufferBodyFrames =[], gtArray = [], exArray = [];
+
+  // Reference Info: Use this to find out current position we reached in reference.
+  var refPos = 0;
+  var actionStart = false;
+  var headStart = false;
+  var actionTimeCount = 3, actionLastTime=0;
+  var last_recJoints = null;
+  var python_running = false, python_result =[100, [1]];
 
 	// Start Time for the test
 	var startTime, duration;
@@ -37,7 +46,7 @@ if(kinect.open()) {
 		++clients;
 		console.log('a user connected');
 		// systemState could be 0..3 during connection event, but only 2 needs signal emission
-		if (systemState == 2) {
+		if (systemState === 2) {
 			socket.emit('disp',bufferBodyFrames,systemState, bodyIndex, activityLabeled);
 		}
 
@@ -51,7 +60,12 @@ if(kinect.open()) {
 					bufferBodyFrames = [];
 					console.log('System in Recording state');
 					startTime = new Date().getTime();
-				break;
+					// Init variables for reference
+          refPos = 0;
+          actionStart=false;
+          headStart=false;
+          actionTimeCount=3;
+				  break;
 
 				case 2: // 1->2, Push the BodyFrames Data to the current trial
 					duration = ((new Date().getTime() - startTime)/1000).toFixed(2);
@@ -65,12 +79,17 @@ if(kinect.open()) {
 					console.log('system in Result Display state'); // Action
 					socket.emit('disp',bufferBodyFrames,systemState, bodyIndex, activityLabeled); // activityLabeled should be false because recording is just ended
 					socket.broadcast.emit('disp',bufferBodyFrames,systemState, bodyIndex, activityLabeled);
-				break;
+					break;
 
 				case 0: // 2->0, get the system from Result Disp to Live state.
+          console.log("Buffer Length: ", bufferTrial.length);
+          console.log("Reference Index: ", (gtArray).toString());
+          console.log("Exercise index: ", (exArray).toString());
 					kinect.openBodyReader();// No Other Specific Actions in this block because it is done by kinect.on()
 					console.log('system in Live state');
+					break;
 				default:
+          console.log("Something wrong, you should never see this");
 			}
 		});
 		// Speical Buttons: label buttons(3), report button(1), save(1) & curve show(1)
@@ -83,7 +102,7 @@ if(kinect.open()) {
 			activityLabeled = true;
 			socket.emit('serverDataLabeled');
 			socket.broadcast.emit('serverDataLabeled');
-		})
+		});
 
 		socket.on('analyze',function(){
 	    console.log('analyze signal received!');
@@ -101,6 +120,21 @@ if(kinect.open()) {
 			socket.emit('curveResult',curveData);
 		});
 
+    // To save data as json file
+    socket.on("save", function(){
+      console.log("Received save data signal");
+      re_data = [];
+      ex_data = [];
+      for(var i=0; i<bufferTrial.length; i++){
+        if (i in gtArray){re_data.push(bufferTrial[i]);}
+        else if(i in exArray){ex_data.push(bufferTrial[i]);}
+      }
+      fs.writeFile("ref_data.json", JSON.stringify(re_data, null, "  "), function(err){if(err){return console.log(err);}});
+      console.log("Reference Data saved.");
+      fs.writeFile("exe_data.json", JSON.stringify(ex_data, null, "  "), function(err){if(err){return console.log(err);}});
+      console.log("Exercise Data saved.");
+    });
+
 		// States
 		kinect.on('bodyFrame', function(bodyFrame){
 			console.log("new bodyframe received...");
@@ -108,21 +142,131 @@ if(kinect.open()) {
 
 			switch (systemState) {
 				case 1: //recording: save the data being recorded, give identification to client
-					socket.emit('rec', bodyFrame, systemState, bodyIndex);
-					socket.broadcast.emit('rec', bodyFrame, systemState, bodyIndex);
-					bufferBodyFrames.push(bodyFrame); // save the bodyFrame by pushing it to buffer
-					break;
+          // Check if we can start to send out reference
+          if ('joints' in bodyFrame.bodies[bodyIndex] && !actionStart){
+            // Condition 1: Head in center circle
+            var headPos = bodyFrame.bodies[bodyIndex].joints[2];
+            var headReady = (((headPos.depthX - 0.5) ** 2 + (headPos.depthY - 0.2) ** 2) <= 0.1 ** 2);
+            // Condition 2: Position start, given head is ready
+            if (headReady){
+              // If reference exist, compare reference, otherwise use common points detection
+              if (gtArray.length > 0) {
+                // Use least square (affine transformation) to compare similarity between current position with ref
+                var body_index = locateBodyTrackedIndex([bufferTrial[gtArray[gtArray.length - 1]][0]]);
+                var frameBody_index = locateBodyTrackedIndex([bodyFrame]);
+                var joints1 = bufferTrial[gtArray[gtArray.length-1]][0].bodies[body_index].joints;
+                var joints2 = bodyFrame.bodies[frameBody_index].joints;
+                var points_list = [...Array(Math.min(joints1.length, joints2.length)).keys()];
+                var x = [], y = [];
+                points_list.map(function (point_index) {
+                  // Add one extra dimension 1, used for translation
+                  x.push([joints1[point_index].depthX, joints1[point_index].depthY, 1]);
+                  y.push([joints2[point_index].depthX, joints2[point_index].depthY, 1]);
+                });
+                python_result = lstsq(x, y);
+                if(python_result[0] < 1){
+                  console.log("Passed posture detection using least square");
+                  actionStart = true;
+                }
+              } // End of if (gtArray.length > 0) : then
+              else{
+                // If reference not defined, use common points to detect action start
+                if (last_recJoints === null)
+                  last_recJoints = bodyFrame.bodies[bodyIndex].joints;
+                var c_p = distance_joint2joints_commonPoints({joints1: last_recJoints, joints2:bodyFrame.bodies[bodyIndex].joints, pointThreshold: 0.1});
+                if (c_p > last_recJoints.length - 5) {
+                  last_recJoints = bodyFrame.bodies[bodyIndex].joints;
+                  console.log("current common points ", c_p);
+                }
+                else{
+                  console.log("Passed posture detection using commonpoints");
+                  actionStart = true;
+                  last_recJoints = null;
+                }
+              } // End of if (gtArray.length > 0) : else
+            }
+            else{
+              // If head is not ready, just show first frame of reference, if there is any ref
+              if (gtArray.length > 0) {
+                var body_index = locateBodyTrackedIndex([bufferTrial[gtArray[gtArray.length - 1]][refPos]]);
+                var refData = bufferTrial[gtArray[gtArray.length - 1]][0].bodies[body_index];
+                if (refData !== null) {
+                  socket.emit('recRef', refData);
+                  socket.broadcast.emit('refRef', refData);
+                }
+              }
+            } // End of if(headReady) : else
+          } // End of "joints" in frame
+
+          if(gtArray.length > 0 && actionStart){
+            // If action started, Prepare and emit reference data.
+            // countdown and show countdown number
+            if (actionTimeCount >= 0){
+              socket.emit('recRefCountdown', actionTimeCount);
+              socket.broadcast.emit('recRefCountdown', actionTimeCount);
+
+              var c_t = (new Date().getTime()/1000).toFixed(0);
+              if (c_t - actionLastTime >= 1){
+                actionLastTime = c_t;
+                actionTimeCount -= 1;
+              }
+              else {
+                // Only start rest recording when countdown is over, otherwise just update recording canvas
+                socket.emit('rec', bodyFrame, systemState, bodyIndex);
+                socket.broadcast.emit('rec', bodyFrame, systemState, bodyIndex);
+                break;
+              }
+            }
+            else {
+              // When countdown is over, update reference
+              var body_index = locateBodyTrackedIndex([bufferTrial[gtArray[gtArray.length - 1]][refPos]]);
+              var refData = bufferTrial[gtArray[gtArray.length - 1]][refPos].bodies[body_index];
+              if (refData !== null) {
+                socket.emit('recRef', refData);
+                socket.broadcast.emit('refRef', refData);
+              }
+              // Move reference index, can use this to control replay speed
+              refPos += 1;
+              // If meet end of reference, replay it
+              if (refPos >= bufferTrial[gtArray[gtArray.length - 1]].length) {
+                refPos = 0;
+              }
+            }
+          }
+
+          // normal rec data
+          socket.emit('rec', bodyFrame, systemState, bodyIndex);
+          socket.broadcast.emit('rec', bodyFrame, systemState, bodyIndex);
+          if(actionStart){
+            // save the bodyFrame by pushing it to buffer, only save frame when actionStart. Once it start, it will keep recording
+            bufferBodyFrames.push(bodyFrame);
+          }
+          break;
 
 				case 2: //display
 					console.log('system in display state, but system is streaming. Something wrong here.');
 					break;
 
 				case 0: //live
-					bufferBodyFrames = [];
-					bufferBodyFrames.push(bodyFrame); // clean buffer and push the current bodyFrame to buffer. It is used to find the (1) bodyIndex to track.
-					socket.emit('live', bodyFrame,systemState)
-					socket.broadcast.emit('live', bodyFrame,systemState);
-					break;
+          if (gtArray.length > 0) {
+            var body_index = locateBodyTrackedIndex([bufferTrial[gtArray[gtArray.length - 1]][refPos]]);
+            var refData = bufferTrial[gtArray[gtArray.length - 1]][refPos].bodies[body_index];
+            if (refData !== null) {
+              socket.emit('recRef', refData);
+              socket.broadcast.emit('refRef', refData);
+            }
+            // Move reference index
+            refPos += 1;
+            // If meet end of reference, replay it
+            if (refPos >= bufferTrial[gtArray[gtArray.length - 1]].length) {
+              refPos = 0;
+            }
+          }
+          bufferBodyFrames = [];
+          bufferBodyFrames.push(bodyFrame); // clean buffer and push the current bodyFrame to buffer. It is used to find the (1) bodyIndex to track.
+          socket.emit('live', bodyFrame,systemState);
+          socket.broadcast.emit('live', bodyFrame,systemState);
+          break;
 
 				case 3: //3 init
 					bufferBodyFrames = [];
@@ -206,6 +350,109 @@ function getRaw(bufferTrial,id,jt,datatype){
 		}
 	}
 	return rawdata;
+}
+
+/*
+Description: Javascript implementation of least square method. It computes the weight W that minimizes the square
+L2 norm of Y - XW. If Y is a matrix rather than a vector, It returns the lstsq result for each column of Y. i.e.
+W = [W_1, W_2,....,W_n] where W_n = lstsq(X,Y_n), a column vector.
+Parameters:
+    X: N by M array
+    Y; N by K array
+Returns:
+    W: M by K array
+ */
+function lstsq(X, Y)
+{
+  //get dimensions
+  var K = Y[0].length;
+  var N = Y.length;
+  var M = X[0].length;
+
+  //out put array
+  var W = [];
+
+  //compute each W_n
+  for(n = 0; n < K; n++)
+  {
+    var Y_n = numeric.transpose(Y).slice(n, n + 1);
+    Y_n = numeric.transpose(Y_n);
+    // X^T dot X
+    var w_n = numeric.dot(numeric.transpose(X),X);
+    //X^T dot X inverse
+    w_n = numeric.inv(w_n);
+    //X^T dot X inverse dot x^T
+    w_n = numeric.dot(w_n, numeric.transpose(X));
+    //dot y
+    w_n = numeric.dot(w_n, Y_n);
+    W[n] = w_n;
+  }
+  W = numeric.transpose(W);
+
+  // Calculate error
+  var After_trans = numeric.dot(X, W);
+  var err = 0;
+  for (i = 0; i < After_trans.length; i++){
+    for (j = 0; j < After_trans[0].length; j++){
+      err = (After_trans[i][j] - Y[i][j]) ** 2;
+    }
+  }
+  var result = [err, W];
+  return result;
+}
+
+function lstsq_python(joints1, joints2){
+  if (!python_running) {
+    python_running = true;
+    var points_list = [...Array(Math.min(joints1.length, joints2.length)).keys()];
+    var x = [], y = [];
+    points_list.map(function (point_index) {
+      x.push([joints1[point_index].depthX, joints1[point_index].depthY]);
+      y.push([joints2[point_index].depthX, joints2[point_index].depthY]);
+    });
+    var affine_py = spawn('python', ['affine_transformation.py']);
+    var output = null;
+    affine_py.on('error', function (err) {
+      console.log("failed to start python process")
+    });
+    affine_py.stdout.on('data', function (data) {
+      //console.log("***: ", data.toString());
+      python_result = JSON.parse(data.toString());
+      console.log(python_result[0]);
+    });
+    //affine_py.stdout.on('end', function(){console.log("we get least square error: ",output)});
+    affine_py.stderr.on('data', function (data) {
+      console.log("error! ", data.toString());
+    });
+    affine_py.stdio[0].write(JSON.stringify([x, y]));
+    affine_py.stdio[0].end();
+    affine_py.on('close', function(code){python_running=false;});
+    //affine_py.on('close', function(code){console.log("returned code ${code}")});
+  }
+}
+
+function distance_joint2joints_commonPoints(parameters){
+  var joints1 = parameters.joints1;
+  var joints2 = parameters.joints2;
+  var pointThreshold = pointThreshold in parameters? parameters.pointThreshold: 0.01;
+  // Only calculate common parts' common points, common points means points that didn't move much
+  var joint_list = [...Array(Math.min(joints1.length, joints2.length)).keys()];
+  return joint_list.reduce(function(sum, joint_index){
+    if (((joints1[joint_index].depthX-joints2[joint_index].depthX)**2+(joints1[joint_index].depthY-joints2[joint_index].depthY)**2) <= pointThreshold**2){
+      return sum + 1;
+    }
+    return sum
+  }, 0)
+}
+
+function distance_joints2joints_euclidean(parameters){
+  var joints1 = parameters.joints1;
+  var joints2 = parameters.joints2;
+  // Only calculate common parts' distance
+  var joint_list = [...Array(Math.min(joints1.length, joints2.length)).keys()];
+  return joint_list.reduce(function(sum, joint_index){
+    return sum + (joints1[joint_index] - joints2[joint_index])**2
+  }, 0);
 }
 
 function getSpeed(bufferTrial,id,jt){
